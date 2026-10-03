@@ -10,7 +10,6 @@
  * 首次调用时自动启动 station 模式并完成 Wi-Fi 子系统初始化。
  * 连接过程为异步执行，断开后每隔 3 秒自动重连。
  * - 开放网络可传入空字符串作为密码
- * - 凭据后续可由 BLE 配置功能 (BLE provisioning) 提供
  *
  * @param ssid     目标 AP 的 SSID，不能为空指针且不能为空字符串
  * @param password 目标 AP 的密码，开放网络传空串；WPA/WPA2 至少 8 个字符
