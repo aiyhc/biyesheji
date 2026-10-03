@@ -9,6 +9,7 @@
 
 #include "BLE.h"
 #include "Buzzer.h"
+#include "Key.h"
 #include "OLED.h"
 #include "OLED_Icon.h"
 #include "wifi.h"
@@ -18,10 +19,14 @@ static const char *TAG = "main";
 /* BLE 广播使用的设备名（手机扫描时可看到） */
 #define BLE_DEVICE_NAME			"ESP32S3-BLE"
 
-/* 调试任务参数 */
-#define DEBUG_TASK_PERIOD_MS	1000	/* 刷新周期（ms） */
-#define DEBUG_TASK_STACK_SIZE	4096	/* 任务栈大小（字节） */
-#define DEBUG_TASK_PRIORITY		5		/* 任务优先级 */
+/* UI 刷新和按键扫描参数 */
+#define UI_PAGE_COUNT			15
+#define UI_TASK_PERIOD_MS		10
+#define UI_REFRESH_PERIOD_MS	1000
+#define UI_TASK_STACK_SIZE		4096
+#define UI_TASK_PRIORITY		5
+#define DEBUG_TASK_PERIOD_MS	UI_TASK_PERIOD_MS
+#define DEBUG_TASK_PRIORITY		UI_TASK_PRIORITY
 
 /* 最近一次收到的 BLE 数据最多在 OLED 上显示 16 个字符（一行宽度） */
 #define DEBUG_RX_TEXT_MAX		16
@@ -33,6 +38,7 @@ static volatile bool	 s_ble_rx_updated;					/* 是否有新数据待显示 */
 
 /* BLE 是否初始化成功：失败信息由调试任务统一显示，避免被状态刷新覆盖 */
 static bool s_ble_ready;
+static portMUX_TYPE s_ble_data_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* 第 1 行右侧的状态图标位置（每个图标占 2 个字符位：WiFi 在左，蓝牙在右） */
 #define WIFI_ICON_COLUMN		13
@@ -47,66 +53,122 @@ static void ble_rx_handler(const uint8_t *data, uint16_t length);
  * 只在状态发生变化时刷新对应行，减少软件 I2C 的写入量
  * （软件 I2C 逐位翻转，整屏刷新约需几百毫秒）。
  */
-static void debug_task(void *arg)
+typedef struct {
+	const char *title;
+	const char *line2;
+	const char *line3;
+} UiPage;
+
+static const UiPage s_pages[UI_PAGE_COUNT] = {
+	{ "启动界面", "ESP32-S3 OLED", "系统启动中" },
+	{ "主界面", "照度 -- 温度 --", "" },
+	{ "窗帘控制", "电机: 未接入", "控制器: 未配置" },
+	{ "湿度调节", "当前 -- 目标 60%", "湿度调节: 关闭" },
+	{ "环境数据", "光照 -- lx", "湿度 --% 温度 --" },
+	{ "自动模式", "光照联动: 关闭", "湿度调节: 关闭" },
+	{ "系统设置", "WiFi: 123", "时间: 未配置" },
+	{ "水位/水箱", "水位: --", "传感器未连接" },
+	{ "设备状态", "窗帘: 未接入", "雾化器: 未接入" },
+	{ "按键说明", "K1/K3: 上一页", "K2/K4: 下一页" },
+	{ "WiFi连接", "SSID: 123", "" },
+	{ "NTP时间同步", "NTP: 未配置", "SNTP: 未启动" },
+	{ "低水位报警", "水位: 未知", "传感器未连接" },
+	{ "雾化器运行", "设备: 未接入", "湿度 --%" },
+	{ "语音交互", "BLE: WAIT", "" },
+};
+
+static uint8_t s_current_page;
+
+static void ui_render_page(void)
 {
-	(void)arg;
+	char header[32];
+	char line2[48];
+	char line3[48];
+	char footer[17];
+	char rx_text[DEBUG_RX_TEXT_MAX + 1];
+	uint32_t rx_count;
+	const UiPage *page = &s_pages[s_current_page];
 
-	char	 buffer[32];
-	bool	 last_connected = !BLE_IsConnected();	/* 取反以强制首次刷新 */
-	bool	 last_notify	= !BLE_IsNotifyEnabled();
-	bool	 last_wifi		= wifi_is_connected();
-	uint32_t last_rx_count	= UINT32_MAX;			/* 强制首次刷新 */
+	portENTER_CRITICAL(&s_ble_data_mux);
+	rx_count = s_ble_rx_count;
+	memcpy(rx_text, s_ble_rx_text, sizeof(rx_text));
+	portEXIT_CRITICAL(&s_ble_data_mux);
 
-	for (;;) {
-		/* 第 1 行右侧：WiFi 图标（连上路由器时显示，未连接时清除） */
-		bool wifi_up = wifi_is_connected();
-		if (wifi_up != last_wifi) {
-			last_wifi = wifi_up;
-			OLED_ShowIcon(1, WIFI_ICON_COLUMN, wifi_up ? OLED_IconWifi : NULL);
-			ESP_LOGI(TAG, "Wi-Fi %s", wifi_up ? "connected" : "disconnected");
-		}
+	snprintf(header, sizeof(header), "%02u %s", s_current_page + 1, page->title);
+	snprintf(line2, sizeof(line2), "%s", page->line2);
+	snprintf(line3, sizeof(line3), "%s", page->line3);
 
-		/* 第 2 行：BLE 初始化结果 / 连接状态；第 1 行右侧：蓝牙图标 */
-		bool connected = BLE_IsConnected();
-		if (connected != last_connected || !s_ble_ready) {
-			last_connected = connected;
-
-			if (!s_ble_ready) {
-				OLED_ShowStringPad(2, 1, "蓝牙初始化失败");
-			} else {
-				OLED_ShowStringPad(2, 1, connected ? "蓝牙已连接" : "等待连接");
-			}
-			/* 连接时显示蓝牙图标，未连接时清除 */
-			OLED_ShowIcon(1, BLE_ICON_COLUMN, connected ? OLED_IconBluetooth : NULL);
-			ESP_LOGI(TAG, "BLE %s", connected ? "connected" : "disconnected");
-		}
-
-		/* 第 3 行：Notify 状态 + 接收计数 */
-		bool	 notify	  = BLE_IsNotifyEnabled();
-		uint32_t rx_count = s_ble_rx_count;
-		if (notify != last_notify || rx_count != last_rx_count) {
-			last_notify	  = notify;
-			last_rx_count = rx_count;
-			snprintf(buffer, sizeof(buffer), "NTF:%-3s RX:%u",
-					 notify ? "ON" : "OFF", (unsigned)rx_count);
-			OLED_ShowStringPad(3, 1, buffer);
-		}
-
-		/* 第 4 行：最近一次收到的数据 */
-		if (s_ble_rx_updated) {
-			s_ble_rx_updated = false;
-			snprintf(buffer, sizeof(buffer), ">%s", s_ble_rx_text);
-			OLED_ShowStringPad(4, 1, buffer);
-		}
-
-		vTaskDelay(pdMS_TO_TICKS(DEBUG_TASK_PERIOD_MS));
+	if (s_current_page == 1) {
+		snprintf(line3, sizeof(line3), "WiFi:%s BLE:%s",
+				 wifi_is_connected() ? "ON" : "OFF",
+				 s_ble_ready && BLE_IsConnected() ? "ON" : "OFF");
+	} else if (s_current_page == 8) {
+		snprintf(line3, sizeof(line3), "WiFi:%s BLE:%s",
+				 wifi_is_connected() ? "ON" : "OFF",
+				 s_ble_ready && BLE_IsConnected() ? "ON" : "OFF");
+	} else if (s_current_page == 10) {
+		snprintf(line3, sizeof(line3), "WiFi: %s",
+				 wifi_is_connected() ? "CONNECTED" : "CONNECTING");
+	} else if (s_current_page == 14) {
+		snprintf(line2, sizeof(line2), "BLE: %s",
+				 s_ble_ready && BLE_IsConnected() ? "CONNECTED" : "WAITING");
+		snprintf(line3, sizeof(line3), "RX:%u %.10s", (unsigned)rx_count, rx_text);
 	}
+
+	snprintf(footer, sizeof(footer), "K1/3<%02u/15>K2/4", s_current_page + 1);
+	OLED_ShowStringPad(1, 1, header);
+	OLED_ShowStringPad(2, 1, line2);
+	OLED_ShowStringPad(3, 1, line3);
+	OLED_ShowStringPad(4, 1, footer);
+	ESP_LOGI(TAG, "OLED page %u: %s", s_current_page + 1, page->title);
 }
 
+static void ui_task(void *arg)
+{
+	(void)arg;
+	bool key_ready = (Key_Init() == ESP_OK);
+	if (!key_ready) {
+		ESP_LOGE(TAG, "Key initialization failed; page buttons are unavailable");
+	}
+
+	TickType_t boot_tick = xTaskGetTickCount();
+	TickType_t last_refresh_tick = 0;
+	bool page_dirty = true;
+	ui_render_page();
+
+	for (;;) {
+		if (key_ready) {
+			Key_Scan();
+			uint32_t events = Key_GetEvent();
+			uint32_t previous_mask = (1U << KEY_1) | (1U << KEY_3);
+			uint32_t next_mask = (1U << KEY_2) | (1U << KEY_4);
+
+			if (events & previous_mask) {
+				s_current_page = (s_current_page + UI_PAGE_COUNT - 1) % UI_PAGE_COUNT;
+				page_dirty = true;
+			} else if (events & next_mask) {
+				s_current_page = (s_current_page + 1) % UI_PAGE_COUNT;
+				page_dirty = true;
+			}
+		}
+
+		TickType_t now = xTaskGetTickCount();
+		if (s_current_page == 0 && now - boot_tick >= pdMS_TO_TICKS(2500)) {
+			s_current_page = 1;
+			page_dirty = true;
+		}
+
+		if (page_dirty || now - last_refresh_tick >= pdMS_TO_TICKS(UI_REFRESH_PERIOD_MS)) {
+			ui_render_page();
+			last_refresh_tick = now;
+			page_dirty = false;
+		}
+		vTaskDelay(pdMS_TO_TICKS(UI_TASK_PERIOD_MS));
+	}
+}
 void app_main(void)
 {
 	OLED_Init();
-	OLED_ShowStringPad(1, 1, "蓝牙调试");		/* 第 1 行标题，只在启动时写一次 */
 	ESP_LOGI(TAG, "OLED initialized");
 
 	Buzzer_Init();
@@ -126,11 +188,11 @@ void app_main(void)
 		s_ble_ready = true;
 	}
 
-	/* 创建调试任务：持续刷新 OLED 上的运行状态 */
-	BaseType_t created = xTaskCreate(debug_task, "debug", DEBUG_TASK_STACK_SIZE,
-									 NULL, DEBUG_TASK_PRIORITY, NULL);
+	/* 创建页面任务：扫描按键并绘制当前 UI 页面 */
+	BaseType_t created = xTaskCreate(ui_task, "ui", UI_TASK_STACK_SIZE,
+									 NULL, UI_TASK_PRIORITY, NULL);
 	if (created != pdPASS) {
-		ESP_LOGE(TAG, "Failed to create debug task");
+		ESP_LOGE(TAG, "Failed to create UI task");
 	}
 
 	err = wifi_connect("123", "12345678");
@@ -156,10 +218,11 @@ static void ble_rx_handler(const uint8_t *data, uint16_t length)
 {
 	ESP_LOGI(TAG, "BLE received %u byte(s): %.*s", length, length, (const char *)data);
 
-	s_ble_rx_count++;
-
 	uint16_t copy_length = (length > DEBUG_RX_TEXT_MAX) ? DEBUG_RX_TEXT_MAX : length;
+	portENTER_CRITICAL(&s_ble_data_mux);
+	s_ble_rx_count++;
 	memcpy(s_ble_rx_text, data, copy_length);
 	s_ble_rx_text[copy_length] = '\0';
 	s_ble_rx_updated = true;
+	portEXIT_CRITICAL(&s_ble_data_mux);
 }
