@@ -42,6 +42,7 @@ static bool s_key_down[KEY_COUNT];
 
 /* 消抖计数器：状态变化的连续采样计数 */
 static uint8_t s_key_cnt[KEY_COUNT];
+static int s_last_gpio_level[KEY_COUNT] = {-1, -1, -1, -1};
 
 /* "按下"事件位掩码：bit0=KEY_1 ... bit3=KEY_4 */
 static uint32_t s_key_event;
@@ -76,18 +77,27 @@ esp_err_t Key_Init(void)
 	for (int i = 0; i < KEY_COUNT; i++) {
 		s_key_down[i] = false;
 		s_key_cnt[i] = 0;
+		s_last_gpio_level[i] = gpio_get_level(s_key_gpio[i]);
+		ESP_LOGW(TAG, "K%d input GPIO%d initial level=%d",
+				 i + 1, s_key_gpio[i], s_last_gpio_level[i]);
 	}
 	s_key_event = 0;
 
 	s_key_initialized = true;
-	ESP_LOGI(TAG, "Keys initialized on GPIO14/38/47/48 (active low, internal pull-up)");
+	ESP_LOGW(TAG, "Keys ready: active-low GPIO14/38/47/48");
 	return ESP_OK;
 }
 
 void Key_Scan(void)
 {
 	for (int i = 0; i < KEY_COUNT; i++) {
-		bool raw_down = (gpio_get_level(s_key_gpio[i]) == KEY_LEVEL_DOWN);
+		int level = gpio_get_level(s_key_gpio[i]);
+		if (level != s_last_gpio_level[i]) {
+			s_last_gpio_level[i] = level;
+			ESP_LOGD(TAG, "GPIO%d level changed to %d (K%d)",
+					 s_key_gpio[i], level, i + 1);
+		}
+		bool raw_down = (level == KEY_LEVEL_DOWN);
 
 		if (raw_down == s_key_down[i]) {
 			/* 电平与当前稳定状态一致，清空变化计数 */
@@ -103,6 +113,8 @@ void Key_Scan(void)
 			/* 仅在"松开 -> 按下"的瞬间产生一次事件 */
 			if (raw_down) {
 				s_key_event |= (1U << i);
+				ESP_LOGD(TAG, "K%d pressed on GPIO%d", i + 1,
+						 s_key_gpio[i]);
 			}
 		}
 	}

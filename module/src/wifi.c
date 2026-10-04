@@ -11,13 +11,16 @@
 #include "wifi.h"
 
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
@@ -32,6 +35,7 @@ static bool s_wifi_initialized;
 
 /* 标记 esp_wifi_start() 是否已被调用，防止重复启动 */
 static bool s_wifi_started;
+static bool s_sntp_started;
 /* 标记当前是否已连接到 AP 并获取到 IP（供上层查询连接状态） */
 static bool s_wifi_connected;
 static TimerHandle_t s_reconnect_timer;
@@ -79,6 +83,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 		const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
 		xTimerStop(s_reconnect_timer, 0);
 		s_wifi_connected = true;
+		setenv("TZ", "CST-8", 1);
+		tzset();
+		if (!s_sntp_started) {
+			esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+			esp_sntp_setservername(0, "pool.ntp.org");
+			esp_sntp_init();
+			s_sntp_started = true;
+			ESP_LOGI(TAG, "SNTP time synchronization started");
+		}
 		ESP_LOGI(TAG, "Connected; IP address: " IPSTR, IP2STR(&event->ip_info.ip));
 	}
 }
